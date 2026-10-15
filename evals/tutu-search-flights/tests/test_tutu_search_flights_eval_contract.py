@@ -1,0 +1,502 @@
+"""Recorded Tutu agent-eval outcome contract and mutation proof."""
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+import socket
+import subprocess
+import sys
+from pathlib import Path
+
+from evals.harness.core import evaluate_dimension_details, evaluate_dimensions
+from evals.harness.skill_source import materialize_skill_source
+
+
+ROOT = Path(__file__).resolve().parents[3]
+EVAL = ROOT / "evals" / "tutu-search-flights"
+FIXTURE = EVAL / "fixtures" / "baseline.json"
+CONSUMER_PATH = EVAL / "consumer.py"
+
+
+def load_consumer():
+    spec = importlib.util.spec_from_file_location("tutu_search_flights_consumer", CONSUMER_PATH)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    manifest = json.loads((EVAL / "manifest.json").read_text(encoding="utf-8"))
+    return module.TutuSearchFlightsConsumer(EVAL, ROOT, manifest, hermes_command=["hermes"])
+
+
+def evidence_for(answer: str, scenario: str = "search-results-reflect-tutu") -> dict:
+    fixture = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    return {
+        "scenario": scenario,
+        "final_answer": answer,
+        "recorded_tutu_result": fixture,
+        "semantic_judge": {
+            "status": "PASS",
+            "verdict": "PASS",
+            "claims": [{"claim": "recorded answer", "supported": True}],
+            "model": "contract-test-double",
+        },
+    }
+
+
+def test_outcome_accepts_grounded_answer_and_rejects_unsupported_claim_mutations():
+    consumer = load_consumer()
+    grounded = (
+        "В выдаче есть рейс DP-6949 авиакомпании Победа: вылет в 19:25, "
+        "тариф «Базовый» стоит 4 446,87 ₽."
+    )
+    mutations = {
+        "flight": " Также доступен рейс SU-9999 авиакомпании Аэрофлот.",
+        "flight_association": " Рейс DP-6949 — это S7-2055.",
+        "carrier": " Рейс DP-6949 выполняет авиакомпания S7 Airlines.",
+        "price": " Для рейса DP-6949 цена составляет 1 ₽.",
+        "variant_price": " Для рейса DP-6949 по тарифу «Максимум» цена составляет 4 446,87 ₽.",
+        "fare": " Для рейса DP-6949 доступен тариф «Бизнес Плюс».",
+        "fare_unquoted": " Для рейса DP-6949 доступен тариф Бизнес Плюс.",
+        "baggage": " Для рейса DP-6949 по тарифу «Базовый» включён багаж 20 кг.",
+        "time": " Рейс DP-6949 вылетает в 11:05.",
+        "date": " Для рейса DP-6949 дата вылета 2026-10-16.",
+        "duration": " Рейс DP-6949 длится 48 часов.",
+    }
+
+    grounded_score = evaluate_dimensions(consumer, evidence_for(grounded), {})
+    assert grounded_score["outcome"] == "PASS"
+    for field, mutation in mutations.items():
+        details = evaluate_dimension_details(consumer, evidence_for(grounded + mutation), {})
+        assert details["outcome"]["status"] == "FAIL", field
+        reason = details["outcome"]["reason"] or ""
+        assert {
+            "flight": "unsupported flight identifier",
+            "flight_association": "unsupported flight association",
+            "carrier": "unsupported carrier claim",
+            "price": "price not present",
+            "variant_price": "price not present",
+            "fare": "fare name not present",
+            "fare_unquoted": "fare name not present",
+            "baggage": "baggage quantity is not confirmed",
+            "time": "time not present in Tutu result",
+            "date": "date not present in Tutu result",
+            "duration": "duration not present in Tutu result",
+        }[field] in reason, (field, reason)
+
+
+def test_scenario_2_deterministically_rejects_invented_cabin_baggage_weight():
+    consumer = load_consumer()
+    grounded = "Рейс DP-6949: вес ручной клади в данных Tutu не указан."
+    unsupported = "Рейс DP-6949: ручная кладь — 10 кг."
+
+    grounded_details = consumer.evaluate_dimension_diagnostic(
+        "outcome",
+        evidence_for(grounded, scenario="missing-cabin-baggage-weight"),
+        {},
+    )
+    unsupported_details = consumer.evaluate_dimension_diagnostic(
+        "outcome",
+        evidence_for(unsupported, scenario="missing-cabin-baggage-weight"),
+        {},
+    )
+
+    assert grounded_details["status"] == "PASS", grounded_details
+    assert unsupported_details["status"] == "FAIL", unsupported_details
+    assert "cabin baggage weight is not confirmed" in unsupported_details["reason"]
+
+
+def test_http_429_without_tool_execution_is_unobservable_not_model_failure():
+    consumer = load_consumer()
+    evidence = evidence_for(
+        "HTTP 429: too many concurrent requests",
+        scenario="missing-cabin-baggage-weight",
+    )
+    evidence["tool_names"] = []
+    scenario_rules = consumer.manifest["scenarios"]["missing-cabin-baggage-weight"]["evaluation"]
+
+    outcome = consumer.evaluate_dimension_diagnostic(
+        "outcome", evidence, scenario_rules["outcome"]
+    )
+    trajectory = consumer.evaluate_dimension_diagnostic(
+        "trajectory", evidence, scenario_rules["trajectory"]
+    )
+
+    assert outcome["status"] == "ERROR"
+    assert "PROVIDER_FAILURE" in outcome["reason"]
+    assert trajectory["status"] == "ERROR"
+    assert "PROVIDER_FAILURE" in trajectory["reason"]
+
+
+def test_scenario_3_deterministically_checks_party_price_and_fare_association():
+    consumer = load_consumer()
+    scenario = consumer.manifest["scenarios"]["party-price-and-fare"]
+    fixture_path = EVAL / scenario["fixture"]
+    fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+
+    def evaluate(answer: str, *, include_judge: bool = True) -> dict:
+        evidence = {
+            "scenario": "party-price-and-fare",
+            "final_answer": answer,
+            "recorded_tutu_result": fixture,
+        }
+        if include_judge:
+            evidence["semantic_judge"] = {"status": "PASS"}
+        return consumer.evaluate_dimension_diagnostic(
+            "outcome", evidence, scenario["evaluation"]["outcome"]
+        )
+
+    grounded = (
+        "Для группы из двух взрослых и ребёнка рейс DP-6949: "
+        "тариф «Базовый» — 11 148,23 ₽; «Выгодный» — 18 214 ₽."
+    )
+    assert evaluate(grounded)["status"] == "PASS"
+    assert consumer._outcome_issues(
+        "Рейс DP-6949 длится 3ч 40м.",
+        fixture,
+    ) == []
+    assert consumer._outcome_issues(
+        "Рейс DP-6949 вылетает в 19:25 и длится 3 ч 40 мин. "
+        "Стоимость для группы — 11 148,23 (RUB), маршрут SVO—AER. "
+        "Лимит сбрасывается в 20:44.",
+        fixture,
+    ) == []
+
+    multiplied = (
+        "Для группы из двух взрослых и ребёнка рейс DP-6949 по тарифу "
+        "«Базовый»: 11 148,23 × 3 = 33 444,69 ₽."
+    )
+    multiplied_result = evaluate(multiplied, include_judge=False)
+    assert multiplied_result["status"] == "FAIL", multiplied_result
+    assert "price not present" in multiplied_result["reason"]
+
+    crossed_fare_price = "Рейс DP-6949: тариф «Базовый» стоит 18 214 ₽."
+    crossed_price_result = evaluate(crossed_fare_price, include_judge=False)
+    assert crossed_price_result["status"] == "FAIL", crossed_price_result
+    assert "price not present" in crossed_price_result["reason"]
+
+    crossed_fare_condition = "Рейс DP-6949: по тарифу «Базовый» багаж 10 кг."
+    crossed_condition_result = evaluate(crossed_fare_condition, include_judge=False)
+    assert crossed_condition_result["status"] == "FAIL", crossed_condition_result
+    assert "baggage quantity is not confirmed" in crossed_condition_result["reason"]
+
+
+def test_semantic_judge_cannot_return_fail_without_a_claim_level_failure():
+    consumer = load_consumer()
+    assert consumer._semantic_judge_status({"verdict": "PASS", "claims": [{"supported": True}]}) == "PASS"
+    assert consumer._semantic_judge_status({"verdict": "FAIL", "claims": [{"supported": False}]}) == "FAIL"
+    assert consumer._semantic_judge_status({"verdict": "FAIL", "claims": [{"supported": True}]}) == "ERROR"
+
+
+def test_real_fare_class_and_exchange_window_are_not_misread_as_claims():
+    consumer = load_consumer()
+    fixture = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    answer = (
+        "Рейс DP-6949: тариф «Выгодный», обмен доступен за 48 часов до вылета. "
+        "Также показаны тарифы бизнес-класса. Тарифы и условия такие же, как у S7-2055."
+    )
+    assert consumer._outcome_issues(answer, fixture) == []
+
+
+def test_trajectory_accepts_one_served_call_after_a_recorded_request_mismatch():
+    consumer = load_consumer()
+    fixture = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    expected = fixture["arguments"]
+    served = {
+        "host": "mcp.tutu.ru",
+        "path": "/mcp",
+        "http_method": "POST",
+        "jsonrpc_method": "tools/call",
+        "tool_name": "search_avia",
+        "arguments": expected,
+        "replay_status": "fixture-served",
+    }
+    rejected_attempt = {
+        **served,
+        "arguments": {**expected, "passengers": {"adults": 1}},
+        "replay_status": "request-mismatch",
+    }
+    command = '"$PYTHON" tutu_search_flights.py \'{"origin":"Москва"}\''
+    evidence = {
+        "tool_names": ["terminal"],
+        "terminal_commands": [command],
+        "terminal_invocations": [{"command": command, "success": True, "result_index": 3}],
+        "final_event_index": 4,
+        "mcp_boundary_requests": [rejected_attempt, served],
+        "requested_search_arguments": expected,
+        "actual_search_arguments": expected,
+        "blocked_tutu_egress_attempts": [],
+    }
+    rules = consumer.manifest["scenarios"]["search-results-reflect-tutu"]["evaluation"]["trajectory"]
+    assert consumer.evaluate_dimension_diagnostic("trajectory", evidence, rules)["status"] == "PASS"
+
+
+def test_terminal_trace_recognizes_successful_structured_skill_cli_result():
+    consumer = load_consumer()
+    events = [
+        {"type": "tool_use", "name": "terminal", "input": {"command": '"$PYTHON" tutu_search_flights.py ...'}},
+        {
+            "type": "tool_result",
+            "name": "terminal",
+            "is_error": False,
+            "output": json.dumps({"output": json.dumps({"offers": [{"flight_number": "DP-6949"}]}), "exit_code": 0, "error": None}),
+        },
+        {"type": "result", "text": "done"},
+    ]
+    summary = consumer._event_summary("\n".join(json.dumps(event) for event in events))
+    assert summary["terminal_invocations"][0]["success"] is True
+
+
+def test_terminal_trace_rejects_truncated_structured_cli_output_without_exit_code():
+    structured = json.dumps(
+        {"pricing_basis": "party_total", "offers": [{"flight_number": "DP-6949"}]}
+    )
+    output = json.dumps({"output": structured, "exit_code": 0, "error": None})[:99]
+    events = [
+        {"type": "tool_use", "name": "terminal", "input": {"command": '"$PYTHON" tutu_search_flights.py ...'}},
+        {"type": "tool_result", "name": "terminal", "is_error": False, "output": output},
+        {"type": "result", "text": "done"},
+    ]
+
+    summary = load_consumer()._event_summary(
+        "\n".join(json.dumps(event) for event in events)
+    )
+
+    assert summary["terminal_invocations"][0]["success"] is False
+
+
+def test_terminal_trace_rejects_nonzero_cli_even_when_output_contains_offers():
+    events = [
+        {"type": "tool_use", "name": "terminal", "input": {"command": '"$PYTHON" tutu_search_flights.py ...'}},
+        {
+            "type": "tool_result",
+            "name": "terminal",
+            "is_error": False,
+            "output": json.dumps({"output": json.dumps({"offers": [{"flight_number": "DP-6949"}]}), "exit_code": 7, "error": None}),
+        },
+        {"type": "result", "text": "done"},
+    ]
+
+    summary = load_consumer()._event_summary(
+        "\n".join(json.dumps(event) for event in events)
+    )
+
+    assert summary["terminal_invocations"][0]["success"] is False
+
+
+def test_trajectory_distinguishes_missing_cli_exit_code_from_confirmed_failure():
+    consumer = load_consumer()
+    fixture = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    arguments = fixture["arguments"]
+    command = '"$PYTHON" tutu_search_flights.py ...'
+    evidence = {
+        "tool_names": ["terminal"],
+        "terminal_commands": [command],
+        "terminal_invocations": [{
+            "command": command,
+            "exit_code": None,
+            "success": False,
+            "result_index": 3,
+        }],
+        "final_event_index": 4,
+        "mcp_boundary_requests": [{
+            "host": "mcp.tutu.ru",
+            "path": "/mcp",
+            "http_method": "POST",
+            "jsonrpc_method": "tools/call",
+            "tool_name": "search_avia",
+            "arguments": arguments,
+            "replay_status": "fixture-served",
+        }],
+        "requested_search_arguments": arguments,
+        "actual_search_arguments": arguments,
+        "blocked_tutu_egress_attempts": [],
+    }
+    rules = consumer.manifest["scenarios"]["search-results-reflect-tutu"]["evaluation"]["trajectory"]
+
+    detail = consumer.evaluate_dimension_diagnostic("trajectory", evidence, rules)
+
+    assert detail["status"] == "ERROR"
+    assert "INSUFFICIENT_EVIDENCE" in detail["reason"]
+    evidence["terminal_invocations"][0]["exit_code"] = 7
+    detail = consumer.evaluate_dimension_diagnostic("trajectory", evidence, rules)
+    assert detail["status"] == "FAIL"
+
+
+def test_recorded_boundary_keeps_candidate_cli_parser_and_mcp_sdk_live(tmp_path):
+    fixture = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    skill_path = Path("hermes/skills/travel/tutu-search-flights")
+    materialized = tmp_path / "skills" / "travel" / "tutu-search-flights"
+    manifest = json.loads((EVAL / "manifest.json").read_text(encoding="utf-8"))
+    identity = materialize_skill_source(
+        ROOT,
+        skill_path,
+        manifest["skill_versions"]["candidate"],
+        materialized,
+    )
+    log_path = tmp_path / "mcp-boundary.jsonl"
+    env = os.environ.copy()
+    replay_path = str(EVAL / "replay")
+    env.update(
+        {
+            "PYTHONPATH": os.pathsep.join(
+                value for value in (replay_path, env.get("PYTHONPATH", "")) if value
+            ),
+            "TUTU_EVAL_FIXTURE": str(FIXTURE),
+            "TUTU_EVAL_BOUNDARY_LOG": str(log_path),
+        }
+    )
+    command = [
+        sys.executable,
+        str(materialized / "tutu_search_flights.py"),
+        json.dumps(fixture["arguments"], ensure_ascii=False),
+    ]
+    proc = subprocess.run(command, env=env, text=True, capture_output=True, check=False)
+
+    assert proc.returncode == 0, proc.stderr
+    observed = json.loads(proc.stdout)
+    source_text = fixture["response"]["envelope"]["result"]["content"][0]["text"]
+    source_result = json.loads(source_text)
+    assert len(observed["offers"]) == len(source_result["offers"])
+    assert [offer["flight_number"] for offer in observed["offers"]] == [
+        offer["legs"][0]["segments"][0]["voyage_no"] for offer in source_result["offers"]
+    ]
+
+    records = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    calls = [record for record in records if record.get("jsonrpc_method") == "tools/call"]
+    expected_candidate = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(ROOT),
+            "rev-parse",
+            f"{manifest['skill_versions']['candidate']['ref']}^{{commit}}",
+        ],
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout.strip()
+    assert identity["resolved_commit"] == expected_candidate
+    assert len(calls) == 1
+    assert calls[0]["tool_name"] == "search_avia"
+    assert calls[0]["arguments"] == fixture["arguments"]
+
+
+def test_recorded_boundary_accepts_only_semantically_equivalent_search_arguments(tmp_path):
+    fixture = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    skill_path = Path("hermes/skills/travel/tutu-search-flights")
+    materialized = tmp_path / "skills" / "travel" / "tutu-search-flights"
+    manifest = json.loads((EVAL / "manifest.json").read_text(encoding="utf-8"))
+    materialize_skill_source(ROOT, skill_path, manifest["skill_versions"]["candidate"], materialized)
+    log_path = tmp_path / "mcp-boundary.jsonl"
+    env = os.environ.copy()
+    replay_path = str(EVAL / "replay")
+    env.update({
+        "PYTHONPATH": os.pathsep.join(value for value in (replay_path, env.get("PYTHONPATH", "")) if value),
+        "TUTU_EVAL_FIXTURE": str(FIXTURE),
+        "TUTU_EVAL_BOUNDARY_LOG": str(log_path),
+    })
+    cli = [sys.executable, str(materialized / "tutu_search_flights.py")]
+    expected = fixture["arguments"]
+    equivalent = {
+        **expected,
+        "adults": 1,
+        "page": 1,
+        "sort": "price_asc",
+        "view": "compact",
+    }
+    accepted = subprocess.run(
+        [*cli, json.dumps(equivalent, ensure_ascii=False)], env=env, text=True, capture_output=True
+    )
+    assert accepted.returncode == 0, accepted.stderr
+    assert json.loads(accepted.stdout)["offers"]
+    recorded = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    calls = [item for item in recorded if item.get("jsonrpc_method") == "tools/call"]
+    assert calls[-1]["replay_status"] == "fixture-served-equivalent"
+
+    for changes in (
+        {"origin": "MOW"},
+        {"destination": "Адлер"},
+        {"departure_date": "2026-10-16"},
+        {"adults": 2},
+        {"page_size": 2},
+        {"view": "full"},
+    ):
+        changed = {**expected, **changes}
+        rejected = subprocess.run(
+            [*cli, json.dumps(changed, ensure_ascii=False)], env=env, text=True, capture_output=True
+        )
+        assert rejected.returncode != 0, changes
+    recorded = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    calls = [item for item in recorded if item.get("jsonrpc_method") == "tools/call"]
+    assert [item["replay_status"] for item in calls] == [
+        "fixture-served-equivalent",
+        "request-mismatch",
+        "request-mismatch",
+        "request-mismatch",
+        "request-mismatch",
+        "request-mismatch",
+        "request-mismatch",
+    ]
+
+
+def test_eval_case_selects_requested_skill_version():
+    path = EVAL / "run_eval.py"
+    spec = importlib.util.spec_from_file_location("tutu_search_flights_run_eval", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    manifest = json.loads((EVAL / "manifest.json").read_text(encoding="utf-8"))
+
+    assert module._case(manifest, skill_version="candidate")["skill_versions"] == [
+        "candidate"
+    ]
+    assert module._case(manifest, skill_version="baseline")["skill_versions"] == [
+        "baseline"
+    ]
+
+
+def test_candidate_source_tracks_declared_ref_and_baseline_stays_pinned(tmp_path):
+    manifest = json.loads((EVAL / "manifest.json").read_text(encoding="utf-8"))
+    skill_path = Path(manifest["skill"]["path"]).parent
+    candidate_dir = tmp_path / "candidate"
+    candidate = manifest["skill_versions"]["candidate"]
+    candidate_identity = materialize_skill_source(
+        ROOT, skill_path, candidate, candidate_dir
+    )
+    expected_candidate = subprocess.run(
+        ["git", "-C", str(ROOT), "rev-parse", f"{candidate['ref']}^{{commit}}"],
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout.strip()
+    assert candidate_identity["resolved_commit"] == expected_candidate
+    assert candidate["reference_commit"] == "55effd14b8245125cf9c47e65aad4dd84e8ec24a"
+    assert candidate["ref"] == candidate["reference_commit"]
+
+    baseline_dir = tmp_path / "baseline"
+    baseline = manifest["skill_versions"]["baseline"]
+    baseline_identity = materialize_skill_source(
+        ROOT, skill_path, baseline, baseline_dir
+    )
+    assert baseline_identity["resolved_commit"] == (
+        "ab1ae0ff622be6a78466ccc12f3be71bdb0abceb"
+    )
+
+
+def test_egress_guard_blocks_live_tutu_connect(tmp_path):
+    spec = importlib.util.spec_from_file_location(
+        "tutu_search_flights_egress_contract", EVAL / "replay" / "egress_proxy.py"
+    )
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    blocker = module.TutuEgressGuard(tmp_path / "blocked.jsonl")
+    blocker.start()
+    try:
+        with socket.create_connection(("127.0.0.1", int(blocker.url.rsplit(":", 1)[1]))) as connection:
+            connection.sendall(b"CONNECT mcp.tutu.ru:443 HTTP/1.1\r\nHost: mcp.tutu.ru:443\r\n\r\n")
+            response = connection.recv(4096).decode("latin-1")
+        assert response.startswith("HTTP/1.1 403 Forbidden")
+        assert blocker.records() == [{"host": "mcp.tutu.ru", "method": "CONNECT", "blocked": True}]
+    finally:
+        blocker.close()

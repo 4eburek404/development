@@ -1,0 +1,38 @@
+[project]
+name = "tutu-search-flights"
+version = "0.1.0"
+description = "Research and recorded Tutu MCP responses for flight-search specifications"
+requires-python = ">=3.11"
+# Runtime dependencies are added in the same change that starts using them.
+# An unused dependency is a defect here, not a spare part.
+dependencies = [
+    "pydantic>=2,<3",
+    "mcp==2.2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0,<10",
+  "ruff>=0.6,<0.16",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+addopts = "-q --strict-markers"
+markers = [
+  "live: calls the live Tutu MCP server; opt-in, never part of the gate",
+]
+
+[tool.ruff]
+line-length = 100
+src = ["tests", "scripts"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "DTZ", "RUF"]
+# Документы, докстринги и имена в тестах пишутся по-русски — это решение проекта.
+# RUF001/002/003 ищут кириллицу, похожую на латиницу, и на русском тексте дают
+# только шум: «о» в русском слове — это буква «о», а не спутанная `o`.
+ignore = ["RUF001", "RUF002", "RUF003"]
